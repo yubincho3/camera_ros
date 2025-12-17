@@ -33,6 +33,7 @@
 #include <memory>
 #include <opencv2/core/mat.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <optional>
 #include <rcl/context.h>
 #include <rcl_interfaces/msg/floating_point_range.hpp>
@@ -115,6 +116,9 @@ private:
 
   // compression quality parameter
   std::atomic_uint8_t jpeg_quality;
+
+  double resize_scale;
+  double frame_rate;
 
   void
   requestComplete(libcamera::Request *const request);
@@ -263,6 +267,18 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   const uint32_t w = declare_parameter<int64_t>("width", {}, param_descr_ro);
   const uint32_t h = declare_parameter<int64_t>("height", {}, param_descr_ro);
   const libcamera::Size size {w, h};
+
+  // resize scale
+  rcl_interfaces::msg::ParameterDescriptor param_descr_scale;
+  param_descr_scale.description = "Resize scale factor (e.g., 0.5 for half, 2.0 for double)";
+  param_descr_scale.read_only = true;
+  resize_scale = declare_parameter<double>("resize_scale", 1.0, param_descr_scale);
+
+  // frame rate
+  rcl_interfaces::msg::ParameterDescriptor param_descr_fps;
+  param_descr_fps.description = "Desired frame rate in Hz (e.g., 30)";
+  param_descr_fps.read_only = true;
+  frame_rate = declare_parameter<double>("frame_rate", 0, param_descr_fps);
 
   // Raw format dimensions
   rcl_interfaces::msg::ParameterDescriptor param_descr_sensor_mode;
@@ -570,7 +586,54 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   camera->requestCompleted.connect(this, &CameraNode::requestComplete);
 
   // start camera with initial controls
-  if (camera->start(&parameter_handler.get_control_values()))
+  libcamera::ControlList controls = parameter_handler.get_control_values();
+
+  if (frame_rate > 0) {
+    int64_t duration_us = static_cast<int64_t>(1000000.0 / frame_rate);
+
+    // validate against hardware limits
+    const auto &ctrls_info = camera->controls();
+    const auto it = ctrls_info.find(&libcamera::controls::FrameDurationLimits);
+
+    if (it != ctrls_info.end()) {
+      const int64_t min_limit_us = it->second.min().get<int64_t>();
+      const int64_t max_limit_us = it->second.max().get<int64_t>();
+
+      if (duration_us < min_limit_us) {
+        double max_fps = 1000000.0 / min_limit_us;
+        RCLCPP_WARN_STREAM(get_logger(), 
+          "Requested frame rate (" << frame_rate << " Hz) exceeds hardware limit. "
+          << "Clamping to max supported: " << max_fps << " Hz");
+        duration_us = min_limit_us;
+      }
+      else if (duration_us > max_limit_us) {
+        double min_fps = 1000000.0 / max_limit_us;
+        RCLCPP_WARN_STREAM(get_logger(), 
+          "Requested frame rate (" << frame_rate << " Hz) is too slow for hardware. "
+          << "Clamping to min supported: " << min_fps << " Hz");
+        duration_us = max_limit_us;
+      }
+    }
+
+    controls.set(libcamera::controls::FrameDurationLimits,
+                 libcamera::Span<const int64_t, 2>({duration_us, duration_us}));
+
+    RCLCPP_INFO_STREAM(get_logger(), "Frame rate set to " << frame_rate << " Hz (Duration: " << duration_us << " us)");
+
+    // warn if exposure time is limited by frame rate
+    const auto it_exposure = ctrls_info.find(&libcamera::controls::ExposureTime);
+    if (it_exposure != ctrls_info.end()) {
+      const int64_t sensor_max_exposure = it_exposure->second.max().get<int64_t>();
+
+      if (duration_us < sensor_max_exposure) {
+        RCLCPP_WARN_STREAM(get_logger(), 
+          "Max exposure time is now limited to " << duration_us << " us (Sensor max: " << sensor_max_exposure << " us). "
+          << "Images may appear darker in low-light conditions.");
+      }
+    }
+  }
+
+  if (camera->start(&controls))
     throw std::runtime_error("failed to start camera");
 
   // queue all requests
@@ -661,17 +724,76 @@ CameraNode::process(libcamera::Request *const request)
       auto msg_img = std::make_unique<sensor_msgs::msg::Image>();
       auto msg_img_compressed = std::make_unique<sensor_msgs::msg::CompressedImage>();
 
+      // Check resize condition
+      const bool do_resize = (resize_scale > 0) && (std::abs(resize_scale - 1.0) > 1e-6);
+
+      // Initialize final dimensions with original size
+      uint32_t final_width = cfg.size.width;
+      uint32_t final_height = cfg.size.height;
+
       if (format_type(cfg.pixelFormat) == FormatType::RAW) {
         // raw uncompressed image
         assert(buffer_info[buffer].size == bytesused);
         msg_img->header = hdr;
-        msg_img->width = cfg.size.width;
-        msg_img->height = cfg.size.height;
-        msg_img->step = cfg.stride;
         msg_img->encoding = get_ros_encoding(cfg.pixelFormat);
         msg_img->is_bigendian = (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
-        msg_img->data.resize(buffer_info[buffer].size);
-        memcpy(msg_img->data.data(), buffer_info[buffer].data, buffer_info[buffer].size);
+
+        bool resize_success = false;
+
+        if (do_resize) {
+          const int src_channels = cfg.stride / cfg.size.width;
+
+          int cv_type = -1;
+          switch (src_channels) {
+            case 1: cv_type = CV_8UC1; break; // Mono8
+            case 2: cv_type = CV_8UC2; break; // YUYV, UYVY, Mono16, ...
+            case 3: cv_type = CV_8UC3; break; // BGR8, RGB8
+            case 4: cv_type = CV_8UC4; break; // BGRA8, RGBA8
+            default:
+              RCLCPP_ERROR_STREAM(get_logger(), "Unsupported bytes per pixel for resize: " << src_channels);
+              break;
+          }
+
+          if (cv_type != -1) {
+            cv::Mat src_img(cfg.size.height, cfg.size.width, cv_type, const_cast<void*>(buffer_info[buffer].data), cfg.stride);
+            cv::Mat dst_img;
+
+            final_width = std::max(1u, static_cast<uint32_t>(cfg.size.width * resize_scale));
+            final_height = std::max(1u, static_cast<uint32_t>(cfg.size.height * resize_scale));
+
+            cv::resize(src_img, dst_img, cv::Size(final_width, final_height), cv::INTER_LINEAR);
+
+            msg_img->width = final_width;
+            msg_img->height = final_height;
+            msg_img->step = static_cast<uint32_t>(dst_img.step);
+            // encoding is already set above
+
+            size_t data_size = dst_img.total() * dst_img.elemSize();
+            msg_img->data.resize(data_size);
+
+            if (dst_img.isContinuous()) {
+              memcpy(msg_img->data.data(), dst_img.data, data_size);
+            } else {
+              for (int i = 0; i < dst_img.rows; ++i) {
+                memcpy(&msg_img->data[i * msg_img->step], dst_img.ptr(i), dst_img.cols * dst_img.elemSize());
+              }
+            }
+            resize_success = true;
+          }
+        } 
+        
+        // If resize was not requested or failed, copy original buffer
+        if (!resize_success) {
+          msg_img->width = cfg.size.width;
+          msg_img->height = cfg.size.height;
+          msg_img->step = cfg.stride;
+          msg_img->data.resize(buffer_info[buffer].size);
+          memcpy(msg_img->data.data(), buffer_info[buffer].data, buffer_info[buffer].size);
+          
+          // Ensure dimensions are reset to original just in case
+          final_width = cfg.size.width;
+          final_height = cfg.size.height;
+        }
 
         // compress to jpeg
         if (pub_image_compressed->get_subscription_count()) {
@@ -706,6 +828,27 @@ CameraNode::process(libcamera::Request *const request)
 
       sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
       ci.header = hdr;
+
+      // If resized, scale the intrinsic parameters
+      if (do_resize && (final_width != cfg.size.width || final_height != cfg.size.height)) {
+          // Scale Intrinsic Matrix (K)
+          ci.k[0] *= resize_scale; // fx
+          ci.k[2] *= resize_scale; // cx
+          ci.k[4] *= resize_scale; // fy
+          ci.k[5] *= resize_scale; // cy
+
+          // Scale Projection Matrix (P)
+          ci.p[0] *= resize_scale; // fx'
+          ci.p[2] *= resize_scale; // cx'
+          ci.p[3] *= resize_scale; // Tx
+          ci.p[5] *= resize_scale; // fy'
+          ci.p[6] *= resize_scale; // cy'
+
+          // Update Image Size
+          ci.width = final_width;
+          ci.height = final_height;
+      }
+
       pub_ci->publish(ci);
     }
     else if (request->status() == libcamera::Request::RequestCancelled) {
